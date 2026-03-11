@@ -8,6 +8,8 @@ export const IPC = {
   HWP_READ_DOCUMENT: 'hwp:read-document',
   HWP_APPLY_EDITS: 'hwp:apply-edits',
   HWP_REVERT_EDITS: 'hwp:revert-edits',
+  HWP_ACCEPT_INLINE: 'hwp:accept-inline',
+  HWP_REJECT_INLINE: 'hwp:reject-inline',
   HWP_GET_SELECTION: 'hwp:get-selection',
   HWP_STATUS_CHANGED: 'hwp:status-changed',
 
@@ -35,8 +37,8 @@ export const IPC = {
 
 // 기본 설정값
 export const DEFAULTS = {
-  AI_PROVIDER: 'claude' as const,
-  MODEL: 'claude-sonnet-4-20250514',
+  AI_PROVIDER: 'openai' as const,
+  MODEL: 'gpt-4o',
   WINDOW_RATIO: 0.5,
   WINDOW_SWAP: false,
   THEME: 'light' as const,

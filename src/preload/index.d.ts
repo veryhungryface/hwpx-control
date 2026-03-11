@@ -26,8 +26,10 @@ declare global {
         detect(): Promise<HwpStatus>
         arrangeWindows(layout: 'side-by-side' | 'stacked'): Promise<void>
         readDocument(opts?: { pageRange?: [number, number] }): Promise<DocumentContext>
-        applyEdits(edits: EditCommand[]): Promise<ApplyEditsResult>
+        applyEdits(edits: EditCommand[], messageId?: string): Promise<ApplyEditsResult>
         revertEdits(editIds: string[]): Promise<ApplyEditsResult>
+        acceptInline(): Promise<void>
+        rejectInline(): Promise<void>
         getSelection(): Promise<{ text: string } | null>
         onStatusChanged(callback: (status: HwpStatus) => void): () => void
       }

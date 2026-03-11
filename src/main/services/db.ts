@@ -1,4 +1,7 @@
-import BetterSqlite3 from 'better-sqlite3'
+// Use createRequire to bypass Rollup's require interception for native addons
+import { createRequire } from 'module'
+const nativeRequire = createRequire(__filename)
+const BetterSqlite3 = nativeRequire('better-sqlite3') as typeof import('better-sqlite3')
 import { nanoid } from 'nanoid'
 import type { Session, Message, EditCommand, EditStatus, EditHistoryEntry, Attachment } from '../../shared/types'
 

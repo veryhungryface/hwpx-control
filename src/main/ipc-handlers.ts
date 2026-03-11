@@ -66,8 +66,8 @@ export function registerIpcHandlers(params: {
     hwpService.arrangeWindows(hwnd, ratio, swap)
   })
 
-  ipcMain.handle(IPC.HWP_READ_DOCUMENT, (_event, opts?: { pageRange?: [number, number] }) => {
-    return hwpService.readDocumentContext(opts?.pageRange)
+  ipcMain.handle(IPC.HWP_READ_DOCUMENT, async (_event, opts?: { pageRange?: [number, number] }) => {
+    return await hwpService.readDocumentContext(opts?.pageRange)
   })
 
   ipcMain.handle(IPC.HWP_APPLY_EDITS, async (_event, edits: EditCommand[], messageId?: string) => {
@@ -85,7 +85,7 @@ export function registerIpcHandlers(params: {
       )
     })
 
-    const result = hwpService.applyEdits(edits)
+    const result = await hwpService.applyEdits(edits)
 
     // Update edit_history statuses
     const now = new Date().toISOString()
@@ -126,7 +126,7 @@ export function registerIpcHandlers(params: {
         }
       })
 
-    const result = hwpService.applyEdits(revertEdits)
+    const result = await hwpService.applyEdits(revertEdits)
 
     // Mark entries as reverted
     const now = new Date().toISOString()
@@ -135,6 +135,14 @@ export function registerIpcHandlers(params: {
     })
 
     return result
+  })
+
+  ipcMain.handle(IPC.HWP_ACCEPT_INLINE, async () => {
+    await hwpService.acceptInlineEdits()
+  })
+
+  ipcMain.handle(IPC.HWP_REJECT_INLINE, async () => {
+    await hwpService.rejectInlineEdits()
   })
 
   ipcMain.handle(IPC.HWP_GET_SELECTION, () => {
@@ -167,7 +175,7 @@ export function registerIpcHandlers(params: {
       // 3. Read document context from HWP
       let documentContext = null
       try {
-        documentContext = hwpService.readDocumentContext(pageRange)
+        documentContext = await hwpService.readDocumentContext(pageRange)
       } catch {
         // HWP may not be connected — proceed without context
       }
@@ -343,12 +351,13 @@ export function registerIpcHandlers(params: {
         if (provider === 'claude') {
           const Anthropic = (await import('@anthropic-ai/sdk')).default
           const client = new Anthropic({ apiKey: key })
-          // Lightweight call — list models to verify the key without consuming tokens
           await client.models.list({ limit: 1 })
           return { valid: true }
         } else {
-          // OpenAI validation placeholder
-          return { valid: false, error: 'OpenAI 지원은 아직 준비 중입니다.' }
+          const OpenAI = (await import('openai')).default
+          const client = new OpenAI({ apiKey: key })
+          await client.models.list({ limit: 1 })
+          return { valid: true }
         }
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err)

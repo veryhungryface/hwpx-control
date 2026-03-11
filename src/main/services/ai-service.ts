@@ -1,4 +1,5 @@
 import Anthropic from '@anthropic-ai/sdk'
+import OpenAI from 'openai'
 import type { DocumentContext, EditCommand } from '../../shared/types'
 import { DEFAULTS } from '../../shared/constants'
 
@@ -117,11 +118,13 @@ export class AiService {
     claude: '',
     openai: ''
   }
+  private provider: 'claude' | 'openai' = DEFAULTS.AI_PROVIDER
   private model: string = DEFAULTS.MODEL
 
   // API 키 설정
   setApiKey(provider: 'claude' | 'openai', key: string): void {
     this.apiKeys[provider] = key
+    this.provider = provider
   }
 
   // 모델 설정
@@ -129,45 +132,47 @@ export class AiService {
     this.model = model
   }
 
-  // 채팅 (스트리밍)
-  async chat(params: ChatParams): Promise<ChatResult> {
-    const { messages, documentContext, mode, onChunk, signal } = params
-
-    const claudeKey = this.apiKeys.claude
-    if (!claudeKey) {
-      throw new Error('Claude API 키가 설정되지 않았습니다.')
-    }
-
-    // 시스템 프롬프트 구성
-    let systemPrompt: string
+  // 시스템 프롬프트 구성
+  private buildSystemPrompt(documentContext: DocumentContext | null, mode: 'edit' | 'chat'): string {
     if (documentContext) {
-      systemPrompt =
-        mode === 'edit'
-          ? buildEditModePrompt(documentContext)
-          : buildChatModePrompt(documentContext)
-    } else {
-      systemPrompt =
-        mode === 'edit'
-          ? '당신은 HWP 문서 편집 AI 비서입니다. 현재 연결된 문서가 없습니다.'
-          : '당신은 HWP 문서에 대해 대화하는 AI 비서입니다. 현재 연결된 문서가 없습니다.'
+      return mode === 'edit'
+        ? buildEditModePrompt(documentContext)
+        : buildChatModePrompt(documentContext)
     }
+    return mode === 'edit'
+      ? '당신은 HWP 문서 편집 AI 비서입니다. 현재 연결된 문서가 없습니다.'
+      : '당신은 HWP 문서에 대해 대화하는 AI 비서입니다. 현재 연결된 문서가 없습니다.'
+  }
 
-    // 토큰 버짓 체크 (간단한 추정)
-    const systemTokens = estimateTokens(systemPrompt)
-    const messagesTokens = messages.reduce(
-      (sum, m) => sum + estimateTokens(m.content),
-      0
-    )
-    const totalEstimated = systemTokens + messagesTokens
-    if (totalEstimated > DEFAULTS.TOKEN_BUDGET) {
-      console.warn(
-        `[AiService] 추정 토큰(${totalEstimated})이 버짓(${DEFAULTS.TOKEN_BUDGET})을 초과합니다.`
+  // 채팅 (스트리밍) — provider에 따라 분기
+  async chat(params: ChatParams): Promise<ChatResult> {
+    const activeProvider = this.provider
+    const key = this.apiKeys[activeProvider]
+
+    if (!key) {
+      throw new Error(
+        activeProvider === 'claude'
+          ? 'Claude API 키가 설정되지 않았습니다.'
+          : 'OpenAI API 키가 설정되지 않았습니다.'
       )
     }
 
-    const client = new Anthropic({ apiKey: claudeKey })
+    if (activeProvider === 'openai') {
+      return this.chatOpenAI(params, key)
+    }
+    return this.chatClaude(params, key)
+  }
 
-    // Anthropic SDK 메시지 형식으로 변환
+  // ── Claude 스트리밍 ────────────────────
+
+  private async chatClaude(params: ChatParams, apiKey: string): Promise<ChatResult> {
+    const { messages, documentContext, mode, onChunk, signal } = params
+
+    const systemPrompt = this.buildSystemPrompt(documentContext, mode)
+    this.warnTokenBudget(systemPrompt, messages)
+
+    const client = new Anthropic({ apiKey })
+
     const anthropicMessages = messages
       .filter((m) => m.role === 'user' || m.role === 'assistant')
       .map((m) => ({
@@ -212,12 +217,71 @@ export class AiService {
     outputTokens = finalMessage.usage.output_tokens
 
     const { text, edits } = AiService.parseEditCommands(fullContent)
+    return { content: text, edits, inputTokens, outputTokens }
+  }
 
-    return {
-      content: text,
-      edits,
-      inputTokens,
-      outputTokens
+  // ── OpenAI 스트리밍 ────────────────────
+
+  private async chatOpenAI(params: ChatParams, apiKey: string): Promise<ChatResult> {
+    const { messages, documentContext, mode, onChunk, signal } = params
+
+    const systemPrompt = this.buildSystemPrompt(documentContext, mode)
+    this.warnTokenBudget(systemPrompt, messages)
+
+    const client = new OpenAI({ apiKey })
+
+    const openaiMessages: OpenAI.ChatCompletionMessageParam[] = [
+      { role: 'system', content: systemPrompt },
+      ...messages
+        .filter((m) => m.role === 'user' || m.role === 'assistant')
+        .map((m) => ({
+          role: m.role as 'user' | 'assistant',
+          content: m.content
+        }))
+    ]
+
+    let fullContent = ''
+    let inputTokens = 0
+    let outputTokens = 0
+
+    const stream = await client.chat.completions.create(
+      {
+        model: this.model,
+        max_tokens: 4096,
+        messages: openaiMessages,
+        stream: true,
+        stream_options: { include_usage: true }
+      },
+      { signal }
+    )
+
+    for await (const chunk of stream) {
+      const delta = chunk.choices?.[0]?.delta
+      if (delta?.content) {
+        fullContent += delta.content
+        onChunk(delta.content)
+      }
+      // Usage is reported in the final chunk
+      if (chunk.usage) {
+        inputTokens = chunk.usage.prompt_tokens ?? 0
+        outputTokens = chunk.usage.completion_tokens ?? 0
+      }
+    }
+
+    const { text, edits } = AiService.parseEditCommands(fullContent)
+    return { content: text, edits, inputTokens, outputTokens }
+  }
+
+  // ── 토큰 버짓 경고 ────────────────────
+
+  private warnTokenBudget(systemPrompt: string, messages: Array<{ content: string }>): void {
+    const systemTokens = estimateTokens(systemPrompt)
+    const messagesTokens = messages.reduce((sum, m) => sum + estimateTokens(m.content), 0)
+    const totalEstimated = systemTokens + messagesTokens
+    if (totalEstimated > DEFAULTS.TOKEN_BUDGET) {
+      console.warn(
+        `[AiService] 추정 토큰(${totalEstimated})이 버짓(${DEFAULTS.TOKEN_BUDGET})을 초과합니다.`
+      )
     }
   }
 

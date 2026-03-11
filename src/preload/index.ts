@@ -46,11 +46,17 @@ const api = {
     readDocument: (opts?: { pageRange?: [number, number] }): Promise<DocumentContext> =>
       ipcRenderer.invoke(IPC.HWP_READ_DOCUMENT, opts),
 
-    applyEdits: (edits: EditCommand[]): Promise<ApplyEditsResult> =>
-      ipcRenderer.invoke(IPC.HWP_APPLY_EDITS, edits),
+    applyEdits: (edits: EditCommand[], messageId?: string): Promise<ApplyEditsResult> =>
+      ipcRenderer.invoke(IPC.HWP_APPLY_EDITS, edits, messageId),
 
     revertEdits: (editIds: string[]): Promise<ApplyEditsResult> =>
       ipcRenderer.invoke(IPC.HWP_REVERT_EDITS, editIds),
+
+    acceptInline: (): Promise<void> =>
+      ipcRenderer.invoke(IPC.HWP_ACCEPT_INLINE),
+
+    rejectInline: (): Promise<void> =>
+      ipcRenderer.invoke(IPC.HWP_REJECT_INLINE),
 
     getSelection: (): Promise<{ text: string } | null> =>
       ipcRenderer.invoke(IPC.HWP_GET_SELECTION),

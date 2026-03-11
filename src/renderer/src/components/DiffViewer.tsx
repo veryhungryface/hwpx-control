@@ -1,220 +1,229 @@
 import { useState } from 'react'
-import { diffWords } from 'diff'
-import type { EditCommand, EditStatus, NumberedParagraph } from '../../../shared/types'
+import type { EditCommand, EditStatus } from '../../../shared/types'
 import { useAppStore } from '../stores/app-store'
 
 interface DiffViewerProps {
   edits: EditCommand[]
   messageId: string
   editStatus: EditStatus
-  documentParagraphs?: NumberedParagraph[]
 }
 
 function ActionBadge({ action }: { action: EditCommand['action'] }) {
   const config = {
-    insert: { label: '삽입', className: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-400' },
-    replace: { label: '교체', className: 'bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-400' },
-    delete: { label: '삭제', className: 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-400' }
+    insert: { label: '삽입', bg: 'bg-emerald-500' },
+    replace: { label: '교체', bg: 'bg-amber-500' },
+    delete: { label: '삭제', bg: 'bg-red-500' }
   }
-  const { label, className } = config[action]
+  const { label, bg } = config[action]
   return (
-    <span className={`inline-block rounded px-1.5 py-0.5 text-[10px] font-semibold ${className}`}>
+    <span className={`inline-block rounded px-1.5 py-0.5 text-[10px] font-bold text-white ${bg}`}>
       {label}
     </span>
   )
 }
 
-function WordDiff({ original, modified }: { original: string; modified: string }) {
-  const parts = diffWords(original, modified)
-  return (
-    <div className="mt-1 rounded-lg bg-white p-2.5 text-sm leading-relaxed dark:bg-gray-900/50">
-      {parts.map((part, i) => {
-        if (part.added) {
-          return (
-            <span
-              key={i}
-              className="rounded-sm bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300"
-            >
-              {part.value}
-            </span>
-          )
-        }
-        if (part.removed) {
-          return (
-            <span
-              key={i}
-              className="rounded-sm bg-red-100 text-red-700 line-through dark:bg-red-900/40 dark:text-red-400"
-            >
-              {part.value}
-            </span>
-          )
-        }
-        return <span key={i}>{part.value}</span>
-      })}
-    </div>
-  )
-}
-
-export function DiffViewer({ edits, messageId, editStatus, documentParagraphs }: DiffViewerProps) {
+export function DiffViewer({ edits, messageId, editStatus }: DiffViewerProps) {
   const updateMessage = useAppStore((s) => s.updateMessage)
-  const [individualStatus, setIndividualStatus] = useState<Record<number, 'accepted' | 'rejected'>>({})
-  const isResolved = editStatus === 'accepted' || editStatus === 'rejected'
+  const [isApplying, setIsApplying] = useState(false)
+  const [showDetail, setShowDetail] = useState(false)
+  const isResolved = editStatus === 'accepted' || editStatus === 'rejected' || editStatus === 'partial'
 
   const handleAcceptAll = async () => {
+    setIsApplying(true)
     try {
-      await window.api.hwp.applyEdits(edits)
-      updateMessage(messageId, { editStatus: 'accepted' })
-    } catch {
-      // Error is handled by the main process
+      // SendKeys로 HWP 보이는 문서에 직접 편집 적용
+      const result = await window.api.hwp.applyEdits(edits, messageId)
+      if (result.applied > 0) {
+        updateMessage(messageId, { editStatus: 'accepted' })
+      } else {
+        updateMessage(messageId, { editStatus: 'partial' })
+      }
+    } catch (e) {
+      console.error('[DiffViewer] acceptAll failed:', e)
+    } finally {
+      setIsApplying(false)
     }
   }
 
-  const handleRejectAll = () => {
+  const handleRejectAll = async () => {
+    // 아직 HWP에 적용되지 않았으므로 상태만 변경
     updateMessage(messageId, { editStatus: 'rejected' })
   }
 
-  const handleAcceptOne = async (index: number) => {
-    try {
-      await window.api.hwp.applyEdits([edits[index]])
-      setIndividualStatus((prev) => ({ ...prev, [index]: 'accepted' }))
-      checkPartialStatus(index, 'accepted')
-    } catch {
-      // Error is handled by the main process
-    }
-  }
+  // Summary
+  const insertCount = edits.filter((e) => e.action === 'insert').length
+  const replaceCount = edits.filter((e) => e.action === 'replace').length
+  const deleteCount = edits.filter((e) => e.action === 'delete').length
 
-  const handleRejectOne = (index: number) => {
-    setIndividualStatus((prev) => ({ ...prev, [index]: 'rejected' }))
-    checkPartialStatus(index, 'rejected')
-  }
-
-  const checkPartialStatus = (currentIndex: number, status: 'accepted' | 'rejected') => {
-    const next = { ...individualStatus, [currentIndex]: status }
-    const allResolved = edits.every((_, i) => next[i] != null)
-    if (allResolved) {
-      const allAccepted = edits.every((_, i) => next[i] === 'accepted')
-      const allRejected = edits.every((_, i) => next[i] === 'rejected')
-      if (allAccepted) updateMessage(messageId, { editStatus: 'accepted' })
-      else if (allRejected) updateMessage(messageId, { editStatus: 'rejected' })
-      else updateMessage(messageId, { editStatus: 'partial' })
-    }
+  // Already resolved
+  if (isResolved) {
+    return (
+      <div
+        className={`flex items-center gap-2 rounded-xl px-4 py-3 text-sm font-medium ${
+          editStatus === 'accepted'
+            ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-900/20 dark:text-emerald-400'
+            : editStatus === 'rejected'
+              ? 'bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400'
+              : 'bg-amber-50 text-amber-700 dark:bg-amber-900/20 dark:text-amber-400'
+        }`}
+      >
+        {editStatus === 'accepted' && (
+          <>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+              <polyline points="20 6 9 17 4 12" />
+            </svg>
+            편집이 문서에 적용되었습니다
+          </>
+        )}
+        {editStatus === 'rejected' && (
+          <>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <line x1="18" y1="6" x2="6" y2="18" />
+              <line x1="6" y1="6" x2="18" y2="18" />
+            </svg>
+            편집이 거절되었습니다
+          </>
+        )}
+        {editStatus === 'partial' && (
+          <>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <circle cx="12" cy="12" r="10" />
+              <line x1="12" y1="8" x2="12" y2="12" />
+              <line x1="12" y1="16" x2="12.01" y2="16" />
+            </svg>
+            일부 편집이 적용되었습니다
+          </>
+        )}
+      </div>
+    )
   }
 
   return (
-    <div className="rounded-xl border border-gray-200 bg-gray-50/50 dark:border-gray-700 dark:bg-gray-800/30">
-      {/* Header with bulk actions */}
-      <div className="flex items-center justify-between border-b border-gray-200 px-3 py-2 dark:border-gray-700">
-        <span className="text-xs font-semibold text-gray-600 dark:text-gray-400">
-          편집 제안 ({edits.length}건)
+    <div className="space-y-3">
+      {/* Edit summary - clickable to expand */}
+      <button
+        onClick={() => setShowDetail(!showDetail)}
+        className="flex w-full items-center justify-between rounded-lg bg-gray-50 px-3 py-2 text-left transition-colors hover:bg-gray-100 dark:bg-gray-800/50 dark:hover:bg-gray-800"
+      >
+        <span className="text-xs font-medium text-gray-600 dark:text-gray-400">
+          편집 제안 {edits.length}건
+          <span className="ml-2 text-gray-400 dark:text-gray-500">
+            {replaceCount > 0 && `교체 ${replaceCount}`}
+            {insertCount > 0 && `${replaceCount > 0 ? ' · ' : ''}삽입 ${insertCount}`}
+            {deleteCount > 0 && `${replaceCount + insertCount > 0 ? ' · ' : ''}삭제 ${deleteCount}`}
+          </span>
         </span>
+        <svg
+          width="14"
+          height="14"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          className={`text-gray-400 transition-transform ${showDetail ? 'rotate-180' : ''}`}
+        >
+          <polyline points="6 9 12 15 18 9" />
+        </svg>
+      </button>
 
-        {!isResolved && editStatus !== 'partial' && (
-          <div className="flex items-center gap-1.5">
-            <button
-              onClick={handleAcceptAll}
-              className="rounded-md bg-emerald-500 px-2.5 py-1 text-[11px] font-medium text-white transition-colors hover:bg-emerald-600"
+      {/* Detail view */}
+      {showDetail && (
+        <div className="space-y-2">
+          {edits.map((edit, index) => (
+            <div
+              key={index}
+              className="rounded-lg border border-gray-100 bg-white p-3 dark:border-gray-700/50 dark:bg-gray-800/30"
             >
-              전체 수락
-            </button>
-            <button
-              onClick={handleRejectAll}
-              className="rounded-md bg-gray-200 px-2.5 py-1 text-[11px] font-medium text-gray-600 transition-colors hover:bg-gray-300 dark:bg-gray-700 dark:text-gray-300 dark:hover:bg-gray-600"
-            >
-              전체 거절
-            </button>
-          </div>
-        )}
+              <div className="mb-1.5 flex items-center gap-2">
+                <ActionBadge action={edit.action} />
+                <span className="text-[11px] text-gray-500 dark:text-gray-400">
+                  {edit.paragraph}번 문단
+                </span>
+              </div>
 
-        {isResolved && (
-          <span
-            className={`text-[11px] font-medium ${
-              editStatus === 'accepted'
-                ? 'text-emerald-600 dark:text-emerald-400'
-                : editStatus === 'rejected'
-                  ? 'text-red-500 dark:text-red-400'
-                  : 'text-amber-600 dark:text-amber-400'
-            }`}
-          >
-            {editStatus === 'accepted' && '수락됨'}
-            {editStatus === 'rejected' && '거절됨'}
-          </span>
-        )}
-
-        {editStatus === 'partial' && (
-          <span className="text-[11px] font-medium text-amber-600 dark:text-amber-400">
-            부분 적용됨
-          </span>
-        )}
-      </div>
-
-      {/* Edit items */}
-      <div className="divide-y divide-gray-100 dark:divide-gray-700/50">
-        {edits.map((edit, index) => {
-          const itemStatus = individualStatus[index]
-          const itemResolved = isResolved || itemStatus != null
-
-          return (
-            <div key={index} className="px-3 py-2.5">
-              {/* Edit header */}
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <ActionBadge action={edit.action} />
-                  <span className="text-xs text-gray-500 dark:text-gray-400">
-                    {edit.paragraph}번 문단
-                  </span>
+              {edit.action === 'replace' && (
+                <div className="space-y-1 text-sm leading-relaxed">
+                  {edit.search && (
+                    <div className="rounded bg-red-50 px-2.5 py-1.5 text-red-700 line-through dark:bg-red-900/20 dark:text-red-400">
+                      {edit.search.length > 120 ? edit.search.slice(0, 120) + '...' : edit.search}
+                    </div>
+                  )}
+                  {edit.text && (
+                    <div className="rounded bg-emerald-50 px-2.5 py-1.5 text-emerald-700 dark:bg-emerald-900/20 dark:text-emerald-300">
+                      {edit.text.length > 120 ? edit.text.slice(0, 120) + '...' : edit.text}
+                    </div>
+                  )}
                 </div>
+              )}
 
-                {!isResolved && !itemResolved && (
-                  <div className="flex items-center gap-1">
-                    <button
-                      onClick={() => handleAcceptOne(index)}
-                      className="rounded px-2 py-0.5 text-[10px] font-medium text-emerald-600 transition-colors hover:bg-emerald-50 dark:text-emerald-400 dark:hover:bg-emerald-900/20"
-                    >
-                      수락
-                    </button>
-                    <button
-                      onClick={() => handleRejectOne(index)}
-                      className="rounded px-2 py-0.5 text-[10px] font-medium text-gray-500 transition-colors hover:bg-gray-100 dark:text-gray-400 dark:hover:bg-gray-700/50"
-                    >
-                      거절
-                    </button>
-                  </div>
-                )}
+              {edit.action === 'insert' && edit.text && (
+                <div className="rounded bg-emerald-50 px-2.5 py-1.5 text-sm leading-relaxed text-emerald-700 dark:bg-emerald-900/20 dark:text-emerald-300">
+                  {edit.text.length > 200 ? edit.text.slice(0, 200) + '...' : edit.text}
+                </div>
+              )}
 
-                {itemResolved && !isResolved && (
-                  <span
-                    className={`text-[10px] font-medium ${
-                      itemStatus === 'accepted'
-                        ? 'text-emerald-500'
-                        : 'text-gray-400'
-                    }`}
-                  >
-                    {itemStatus === 'accepted' ? '수락됨' : '거절됨'}
-                  </span>
-                )}
-              </div>
-
-              {/* Edit content */}
-              <div className="mt-1.5">
-                {edit.action === 'replace' && edit.search && edit.text && (
-                  <WordDiff original={edit.search} modified={edit.text} />
-                )}
-
-                {edit.action === 'insert' && edit.text && (
-                  <div className="mt-1 rounded-lg bg-emerald-50 p-2.5 text-sm leading-relaxed text-emerald-800 dark:bg-emerald-900/20 dark:text-emerald-300">
-                    {edit.text}
-                  </div>
-                )}
-
-                {edit.action === 'delete' && edit.search && (
-                  <div className="mt-1 rounded-lg bg-red-50 p-2.5 text-sm leading-relaxed text-red-700 line-through dark:bg-red-900/20 dark:text-red-400">
-                    {edit.search}
-                  </div>
-                )}
-              </div>
+              {edit.action === 'delete' && (
+                <div className="rounded bg-red-50 px-2.5 py-1.5 text-sm leading-relaxed text-red-700 line-through dark:bg-red-900/20 dark:text-red-400">
+                  {(edit.search || '(문단 삭제)').length > 120
+                    ? (edit.search || '').slice(0, 120) + '...'
+                    : edit.search || '(문단 삭제)'}
+                </div>
+              )}
             </div>
-          )
-        })}
+          ))}
+        </div>
+      )}
+
+      {/* Accept / Reject cards */}
+      <div className="grid grid-cols-2 gap-2.5">
+        <button
+          onClick={handleAcceptAll}
+          disabled={isApplying}
+          className="flex flex-col items-center gap-2 rounded-xl border-2 border-emerald-200 bg-emerald-50 px-4 py-4 transition-all hover:border-emerald-300 hover:bg-emerald-100 active:scale-[0.98] disabled:opacity-50 dark:border-emerald-800 dark:bg-emerald-900/20 dark:hover:bg-emerald-900/30"
+        >
+          <svg
+            width="28"
+            height="28"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2.5"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            className="text-emerald-500"
+          >
+            <polyline points="20 6 9 17 4 12" />
+          </svg>
+          <span className="text-sm font-semibold text-emerald-700 dark:text-emerald-400">
+            {isApplying ? '적용 중...' : 'AI 제안 전체 수락'}
+          </span>
+        </button>
+
+        <button
+          onClick={handleRejectAll}
+          disabled={isApplying}
+          className="flex flex-col items-center gap-2 rounded-xl border-2 border-gray-200 bg-gray-50 px-4 py-4 transition-all hover:border-gray-300 hover:bg-gray-100 active:scale-[0.98] disabled:opacity-50 dark:border-gray-700 dark:bg-gray-800/50 dark:hover:bg-gray-800"
+        >
+          <svg
+            width="28"
+            height="28"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2.5"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            className="text-red-400"
+          >
+            <line x1="18" y1="6" x2="6" y2="18" />
+            <line x1="6" y1="6" x2="18" y2="18" />
+          </svg>
+          <span className="text-sm font-semibold text-gray-600 dark:text-gray-300">
+            AI 제안 전체 거절
+          </span>
+        </button>
       </div>
     </div>
   )

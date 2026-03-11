@@ -1,4 +1,5 @@
 import { IHwpAdapter } from './hwp-adapter'
+import type { Win32HwpAdapter } from './win32-hwp-adapter'
 import {
   ApplyEditsResult,
   DocumentContext,
@@ -16,6 +17,7 @@ export class HwpService {
   private pollTimer: NodeJS.Timeout | null = null
   private status: HwpStatus
   private onStatusChange?: (status: HwpStatus) => void
+  private isPolling = false
 
   constructor(adapter: IHwpAdapter) {
     this.adapter = adapter
@@ -26,6 +28,11 @@ export class HwpService {
       cursorPage: null,
       totalPages: null,
     }
+  }
+
+  /** Win32 어댑터인지 확인 */
+  private isWin32Adapter(): this is { adapter: Win32HwpAdapter } {
+    return 'connectAsync' in this.adapter
   }
 
   // ── 상태 조회 ─────────────────────────────────────────────
@@ -44,48 +51,119 @@ export class HwpService {
     }
     this.onStatusChange = onStatusChange
 
-    const poll = () => {
-      const window = this.adapter.findHwpWindow()
-      if (window !== null) {
-        if (!this.adapter.isConnected()) {
-          this.adapter.connect()
+    const poll = async () => {
+      // 이전 폴링이 아직 진행 중이면 건너뜀
+      if (this.isPolling) return
+      this.isPolling = true
+
+      try {
+        if (this.isWin32Adapter()) {
+          await this.pollWin32()
+        } else {
+          this.pollSync()
         }
-        const cursorPos = this.adapter.getCursorPos()
-        const totalPages = this.adapter.getTotalPages()
-        const nextStatus: HwpStatus = {
-          connected: true,
-          hwpVersion: '한글 2022',
-          docName: window.title,
-          cursorPage: cursorPos.page,
-          totalPages,
-        }
-        const changed = !this.statusEqual(this.status, nextStatus)
-        this.status = nextStatus
-        if (changed) {
-          this.onStatusChange?.(this.getStatus())
-        }
-      } else {
-        if (this.adapter.isConnected()) {
-          this.adapter.disconnect()
-        }
-        const nextStatus: HwpStatus = {
-          connected: false,
-          hwpVersion: null,
-          docName: null,
-          cursorPage: null,
-          totalPages: null,
-        }
-        const changed = !this.statusEqual(this.status, nextStatus)
-        this.status = nextStatus
-        if (changed) {
-          this.onStatusChange?.(this.getStatus())
-        }
+      } catch (e) {
+        console.error('[HwpService] poll error:', e)
+      } finally {
+        this.isPolling = false
       }
     }
 
     // 즉시 첫 번째 폴링 실행
     poll()
     this.pollTimer = setInterval(poll, intervalMs)
+  }
+
+  /** Mock 어댑터용 동기 폴링 */
+  private pollSync(): void {
+    const window = this.adapter.findHwpWindow()
+    if (window !== null) {
+      if (!this.adapter.isConnected()) {
+        this.adapter.connect()
+      }
+      const cursorPos = this.adapter.getCursorPos()
+      const totalPages = this.adapter.getTotalPages()
+      this.updateStatus({
+        connected: true,
+        hwpVersion: '한글',
+        docName: window.title,
+        cursorPage: cursorPos.page,
+        totalPages,
+      })
+    } else {
+      if (this.adapter.isConnected()) {
+        this.adapter.disconnect()
+      }
+      this.updateStatus({
+        connected: false,
+        hwpVersion: null,
+        docName: null,
+        cursorPage: null,
+        totalPages: null,
+      })
+    }
+  }
+
+  /** Win32 어댑터용 비동기 폴링 */
+  private async pollWin32(): Promise<void> {
+    const adapter = this.adapter as Win32HwpAdapter
+    try {
+      const window = await adapter.findHwpWindowAsync()
+      if (window !== null) {
+        if (!adapter.isConnected()) {
+          console.log('[HwpService] HWP window found, connecting...')
+          await adapter.connectAsync()
+        }
+        if (adapter.isConnected()) {
+          const cursorPos = await adapter.getCursorPosAsync()
+          const totalPages = await adapter.getTotalPagesAsync()
+          this.updateStatus({
+            connected: true,
+            hwpVersion: '한글',
+            docName: window.title,
+            cursorPage: cursorPos.page,
+            totalPages,
+          })
+        } else {
+          console.log('[HwpService] connectAsync returned false')
+          this.updateStatus({
+            connected: false,
+            hwpVersion: null,
+            docName: null,
+            cursorPage: null,
+            totalPages: null,
+          })
+        }
+      } else {
+        if (adapter.isConnected()) {
+          adapter.disconnect()
+        }
+        this.updateStatus({
+          connected: false,
+          hwpVersion: null,
+          docName: null,
+          cursorPage: null,
+          totalPages: null,
+        })
+      }
+    } catch (e) {
+      console.error('[HwpService] pollWin32 error:', e)
+      this.updateStatus({
+        connected: false,
+        hwpVersion: null,
+        docName: null,
+        cursorPage: null,
+        totalPages: null,
+      })
+    }
+  }
+
+  private updateStatus(nextStatus: HwpStatus): void {
+    const changed = !this.statusEqual(this.status, nextStatus)
+    this.status = nextStatus
+    if (changed) {
+      this.onStatusChange?.(this.getStatus())
+    }
   }
 
   stopPolling(): void {
@@ -98,23 +176,41 @@ export class HwpService {
 
   // ── 문서 컨텍스트 읽기 ───────────────────────────────────
 
-  readDocumentContext(pageRange?: [number, number]): DocumentContext {
-    const totalPages = this.adapter.getTotalPages()
-
+  async readDocumentContext(pageRange?: [number, number]): Promise<DocumentContext> {
+    let totalPages: number
+    let rawText: string
     let startPage: number
     let endPage: number
 
-    if (pageRange) {
-      startPage = Math.max(1, pageRange[0])
-      endPage = Math.min(totalPages, pageRange[1])
+    if (this.isWin32Adapter()) {
+      const adapter = this.adapter as Win32HwpAdapter
+      totalPages = await adapter.getTotalPagesAsync()
+
+      if (pageRange) {
+        startPage = Math.max(1, pageRange[0])
+        endPage = Math.min(totalPages, pageRange[1])
+      } else {
+        const cursorPos = await adapter.getCursorPosAsync()
+        startPage = Math.max(1, cursorPos.page - DEFAULTS.CONTEXT_PAGE_RANGE)
+        endPage = Math.min(totalPages, cursorPos.page + DEFAULTS.CONTEXT_PAGE_RANGE)
+      }
+
+      rawText = await adapter.getTextRangeAsync(startPage, endPage)
     } else {
-      const cursorPos = this.adapter.getCursorPos()
-      const currentPage = cursorPos.page
-      startPage = Math.max(1, currentPage - DEFAULTS.CONTEXT_PAGE_RANGE)
-      endPage = Math.min(totalPages, currentPage + DEFAULTS.CONTEXT_PAGE_RANGE)
+      totalPages = this.adapter.getTotalPages()
+
+      if (pageRange) {
+        startPage = Math.max(1, pageRange[0])
+        endPage = Math.min(totalPages, pageRange[1])
+      } else {
+        const cursorPos = this.adapter.getCursorPos()
+        startPage = Math.max(1, cursorPos.page - DEFAULTS.CONTEXT_PAGE_RANGE)
+        endPage = Math.min(totalPages, cursorPos.page + DEFAULTS.CONTEXT_PAGE_RANGE)
+      }
+
+      rawText = this.adapter.getTextRange(startPage, endPage)
     }
 
-    const rawText = this.adapter.getTextRange(startPage, endPage)
     const paragraphs = this.parseParagraphs(rawText, startPage)
 
     return {
@@ -148,7 +244,7 @@ export class HwpService {
 
   // ── 편집 적용 ─────────────────────────────────────────────
 
-  applyEdits(edits: EditCommand[]): ApplyEditsResult {
+  async applyEdits(edits: EditCommand[]): Promise<ApplyEditsResult> {
     const result: ApplyEditsResult = {
       applied: 0,
       failed: 0,
@@ -159,9 +255,27 @@ export class HwpService {
       return result
     }
 
-    // CRITICAL: 문단 번호 내림차순(뒤→앞) 정렬하여 인덱스 이동 방지
-    const sorted = [...edits].sort((a, b) => b.paragraph - a.paragraph)
+    // Win32: COM 인라인 편집 (녹색 텍스트)
+    if (this.isWin32Adapter()) {
+      const adapter = this.adapter as Win32HwpAdapter
+      try {
+        const inlineResult = await adapter.applyInlineEditsAsync(edits)
+        return {
+          applied: inlineResult.applied,
+          failed: inlineResult.failed,
+          errors: inlineResult.errors,
+        }
+      } catch (err) {
+        return {
+          applied: 0,
+          failed: edits.length,
+          errors: [err instanceof Error ? err.message : String(err)],
+        }
+      }
+    }
 
+    // Mock: 기존 동기 방식
+    const sorted = [...edits].sort((a, b) => b.paragraph - a.paragraph)
     for (const edit of sorted) {
       try {
         switch (edit.action) {
@@ -174,11 +288,8 @@ export class HwpService {
             break
           }
           case 'replace': {
-            if (edit.search === undefined) {
-              throw new Error(`replace 명령에 search가 없습니다 (paragraph=${edit.paragraph})`)
-            }
-            if (edit.text === undefined) {
-              throw new Error(`replace 명령에 text가 없습니다 (paragraph=${edit.paragraph})`)
+            if (edit.search === undefined || edit.text === undefined) {
+              throw new Error(`replace 명령에 search/text가 없습니다 (paragraph=${edit.paragraph})`)
             }
             this.adapter.findAndReplace(edit.paragraph, edit.search, edit.text)
             result.applied++
@@ -190,7 +301,6 @@ export class HwpService {
             break
           }
           default: {
-            // TypeScript exhaustiveness guard
             const _exhaustive: never = edit.action
             throw new Error(`알 수 없는 편집 액션: ${_exhaustive}`)
           }
@@ -202,6 +312,22 @@ export class HwpService {
     }
 
     return result
+  }
+
+  /** 인라인 편집 수락 (녹색 → 검정) */
+  async acceptInlineEdits(): Promise<void> {
+    if (this.isWin32Adapter()) {
+      const adapter = this.adapter as Win32HwpAdapter
+      await adapter.acceptInlineEditsAsync()
+    }
+  }
+
+  /** 인라인 편집 거절 (Undo) */
+  async rejectInlineEdits(): Promise<void> {
+    if (this.isWin32Adapter()) {
+      const adapter = this.adapter as Win32HwpAdapter
+      await adapter.rejectInlineEditsAsync()
+    }
   }
 
   // ── 선택 텍스트 조회 ─────────────────────────────────────

@@ -6,11 +6,15 @@ import { DEFAULTS } from '../../../shared/constants'
 const MODELS = {
   claude: [
     { value: 'claude-sonnet-4-20250514', label: 'Claude Sonnet 4' },
-    { value: 'claude-opus-4-20250514', label: 'Claude Opus 4' }
+    { value: 'claude-opus-4-20250514', label: 'Claude Opus 4' },
+    { value: 'claude-haiku-4-5-20251001', label: 'Claude Haiku 4.5' }
   ],
   openai: [
     { value: 'gpt-4o', label: 'GPT-4o' },
-    { value: 'gpt-4o-mini', label: 'GPT-4o Mini' }
+    { value: 'gpt-4o-mini', label: 'GPT-4o Mini' },
+    { value: 'gpt-4.1', label: 'GPT-4.1' },
+    { value: 'gpt-4.1-mini', label: 'GPT-4.1 Mini' },
+    { value: 'o3-mini', label: 'o3-mini' }
   ]
 }
 

@@ -3,6 +3,7 @@ import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { initDatabase } from './services/db'
 import { MockHwpAdapter } from './services/hwp-adapter'
+import { Win32HwpAdapter } from './services/win32-hwp-adapter'
 import { HwpService } from './services/hwp-service'
 import { AiService } from './services/ai-service'
 import { registerIpcHandlers } from './ipc-handlers'
@@ -72,7 +73,10 @@ app.whenReady().then(() => {
 
   // ── Initialize HWP service ────────────────────────────────
 
-  const hwpAdapter = new MockHwpAdapter()
+  // Windows에서는 실제 HWP COM 브릿지, 그 외에서는 Mock
+  const hwpAdapter = process.platform === 'win32'
+    ? new Win32HwpAdapter()
+    : new MockHwpAdapter()
   const hwpService = new HwpService(hwpAdapter)
 
   // ── Initialize AI service ─────────────────────────────────
