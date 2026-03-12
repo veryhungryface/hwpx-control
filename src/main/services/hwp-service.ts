@@ -220,6 +220,32 @@ export class HwpService {
     }
   }
 
+  /** 넘버링된 텍스트 반환 (AI 컨텍스트용) */
+  async readNumberedContext(): Promise<{
+    numberedText: string
+    paragraphMap: Record<number, string>
+    totalParagraphs: number
+  }> {
+    if (this.isWin32Adapter()) {
+      const adapter = this.adapter as Win32HwpAdapter
+      return await adapter.getNumberedTextAsync()
+    }
+    // Mock 폴백: 일반 텍스트에서 넘버링 생성
+    const rawText = this.adapter.getFullText()
+    const lines = rawText.split('\n').filter(l => l.trim())
+    const paragraphMap: Record<number, string> = {}
+    const numbered = lines.map((line, i) => {
+      const num = i + 1
+      paragraphMap[num] = line.trim()
+      return `P${num}: ${line.trim()}`
+    })
+    return {
+      numberedText: numbered.join('\n'),
+      paragraphMap,
+      totalParagraphs: lines.length
+    }
+  }
+
   // ── 내부: 원시 텍스트 → NumberedParagraph[] ──────────────
 
   private parseParagraphs(rawText: string, startPage: number): NumberedParagraph[] {

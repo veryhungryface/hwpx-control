@@ -182,7 +182,7 @@ export class MessageService {
       role: role as Message['role'],
       content,
       edits: edits ?? null,
-      editStatus: 'none',
+      editStatus: edits ? 'pending' : 'none',
       tokenInput: tokenInput ?? null,
       tokenOutput: tokenOutput ?? null,
       createdAt: now

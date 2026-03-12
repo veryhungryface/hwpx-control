@@ -205,6 +205,19 @@ export class Win32HwpAdapter implements IHwpAdapter {
     return this._cachedText
   }
 
+  async getNumberedTextAsync(): Promise<{
+    numberedText: string
+    paragraphMap: Record<number, string>
+    totalParagraphs: number
+  }> {
+    const result = await this.send('getNumberedText')
+    return {
+      numberedText: result?.numberedText || '',
+      paragraphMap: result?.paragraphMap || {},
+      totalParagraphs: result?.totalParagraphs || 0
+    }
+  }
+
   getCursorPos(): { page: number; paragraph: number; charIndex: number } {
     return this._cachedCursorPos || { page: 1, paragraph: 1, charIndex: 0 }
   }
@@ -312,8 +325,8 @@ export class Win32HwpAdapter implements IHwpAdapter {
   // ── 인라인 편집 (녹색 텍스트) ─────────────────────
 
   async applyInlineEditsAsync(edits: Array<{ action: string; paragraph: number; search?: string; text?: string }>): Promise<{ applied: number; failed: number; errors: string[] }> {
-    // SendKeys 편집은 UI 조작이므로 타임아웃을 넉넉히 (편집 1건당 ~4초)
-    const timeoutMs = Math.max(30000, edits.length * 5000)
+    // COM AllReplace + FileSave — 빠르지만 FileSave에 시간 필요
+    const timeoutMs = Math.max(15000, edits.length * 2000)
     const result = await this.send('applyInlineEdits', { edits }, timeoutMs)
     if (result?.error) throw new Error(result.error)
     return { applied: result?.applied ?? 0, failed: result?.failed ?? 0, errors: result?.errors ?? [] }

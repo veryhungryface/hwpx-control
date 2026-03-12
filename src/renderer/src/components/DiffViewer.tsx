@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import type { EditCommand, EditStatus } from '../../../shared/types'
 import { useAppStore } from '../stores/app-store'
 
@@ -26,28 +26,94 @@ export function DiffViewer({ edits, messageId, editStatus }: DiffViewerProps) {
   const updateMessage = useAppStore((s) => s.updateMessage)
   const [isApplying, setIsApplying] = useState(false)
   const [showDetail, setShowDetail] = useState(false)
-  const isResolved = editStatus === 'accepted' || editStatus === 'rejected' || editStatus === 'partial'
+  const [error, setError] = useState<string | null>(null)
 
+  const isPending = editStatus === 'pending'
+  const isPreviewing = editStatus === 'previewing'
+  const isResolved = editStatus === 'accepted' || editStatus === 'rejected' || editStatus === 'partial'
+  const autoPreviewDone = useRef(false)
+
+  // 자동 미리보기: pending 상태에서 자동으로 HWP에 마커 삽입
+  useEffect(() => {
+    if (!isPending || autoPreviewDone.current) return
+    autoPreviewDone.current = true
+
+    const doAutoPreview = async () => {
+      setIsApplying(true)
+      setError(null)
+      try {
+        console.log('[DiffViewer] auto-preview: calling applyEdits with', edits.length, 'edits')
+        const result = await window.api.hwp.applyEdits(edits, messageId)
+        console.log('[DiffViewer] applyEdits result:', JSON.stringify(result))
+
+        if (result.applied === 0 && result.failed > 0) {
+          setError(`미리보기 실패: ${result.errors.join(', ')}`)
+          return
+        }
+        if (result.failed > 0) {
+          setError(`일부 실패 (${result.applied}/${result.applied + result.failed})`)
+        }
+        updateMessage(messageId, { editStatus: 'previewing' })
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e)
+        console.error('[DiffViewer] auto-preview failed:', msg)
+        setError(`미리보기 오류: ${msg}`)
+      } finally {
+        setIsApplying(false)
+      }
+    }
+
+    doAutoPreview()
+  }, [isPending, edits, messageId, updateMessage])
+
+  // 수락: 미리보기 중이면 acceptInline, 아니면 직접 적용
   const handleAcceptAll = async () => {
     setIsApplying(true)
+    setError(null)
     try {
-      // SendKeys로 HWP 보이는 문서에 직접 편집 적용
-      const result = await window.api.hwp.applyEdits(edits, messageId)
-      if (result.applied > 0) {
-        updateMessage(messageId, { editStatus: 'accepted' })
+      if (isPreviewing) {
+        console.log('[DiffViewer] handleAcceptAll: calling acceptInline (previewing)')
+        await window.api.hwp.acceptInline()
       } else {
-        updateMessage(messageId, { editStatus: 'partial' })
+        // 미리보기 없이 직접 수락: 마커 삽입 → 즉시 수락
+        console.log('[DiffViewer] handleAcceptAll: calling applyEdits then acceptInline')
+        const result = await window.api.hwp.applyEdits(edits, messageId)
+        console.log('[DiffViewer] applyEdits result:', JSON.stringify(result))
+        if (result.applied === 0 && result.failed > 0) {
+          setError(`편집 적용 실패: ${result.errors.join(', ')}`)
+          return
+        }
+        await window.api.hwp.acceptInline()
       }
+      console.log('[DiffViewer] acceptAll: success')
+      updateMessage(messageId, { editStatus: 'accepted' })
     } catch (e) {
-      console.error('[DiffViewer] acceptAll failed:', e)
+      const msg = e instanceof Error ? e.message : String(e)
+      console.error('[DiffViewer] acceptAll failed:', msg)
+      setError(`수락 오류: ${msg}`)
     } finally {
       setIsApplying(false)
     }
   }
 
+  // 거절: 미리보기 중이면 rejectInline, 아니면 상태만 변경
   const handleRejectAll = async () => {
-    // 아직 HWP에 적용되지 않았으므로 상태만 변경
-    updateMessage(messageId, { editStatus: 'rejected' })
+    setIsApplying(true)
+    setError(null)
+    try {
+      if (isPreviewing) {
+        console.log('[DiffViewer] handleRejectAll: calling rejectInline (previewing)')
+        await window.api.hwp.rejectInline()
+      }
+      console.log('[DiffViewer] rejectAll: success')
+      updateMessage(messageId, { editStatus: 'rejected' })
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      console.error('[DiffViewer] rejectAll failed:', msg)
+      setError(`거절 오류: ${msg}`)
+    } finally {
+      setIsApplying(false)
+    }
   }
 
   // Summary
@@ -100,6 +166,40 @@ export function DiffViewer({ edits, messageId, editStatus }: DiffViewerProps) {
 
   return (
     <div className="space-y-3">
+      {/* Auto-applying banner */}
+      {isPending && isApplying && (
+        <div className="flex items-center gap-2 rounded-lg bg-blue-50 px-3 py-2 text-xs font-medium text-blue-700 dark:bg-blue-900/20 dark:text-blue-400">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="animate-spin">
+            <circle cx="12" cy="12" r="10" />
+            <path d="M12 6v6l4 2" />
+          </svg>
+          HWP 문서에 미리보기 적용 중...
+        </div>
+      )}
+
+      {/* Preview status banner */}
+      {isPreviewing && (
+        <div className="flex items-center gap-2 rounded-lg bg-blue-50 px-3 py-2 text-xs font-medium text-blue-700 dark:bg-blue-900/20 dark:text-blue-400">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <circle cx="12" cy="12" r="10" />
+            <polyline points="12 6 12 12 16 14" />
+          </svg>
+          HWP 문서에 미리보기 적용됨. 수락/거절을 선택하세요.
+        </div>
+      )}
+
+      {/* Error banner */}
+      {error && (
+        <div className="flex items-center gap-2 rounded-lg bg-red-50 px-3 py-2 text-xs font-medium text-red-700 dark:bg-red-900/20 dark:text-red-400">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <circle cx="12" cy="12" r="10" />
+            <line x1="15" y1="9" x2="9" y2="15" />
+            <line x1="9" y1="9" x2="15" y2="15" />
+          </svg>
+          {error}
+        </div>
+      )}
+
       {/* Edit summary - clickable to expand */}
       <button
         onClick={() => setShowDetail(!showDetail)}
@@ -176,52 +276,34 @@ export function DiffViewer({ edits, messageId, editStatus }: DiffViewerProps) {
         </div>
       )}
 
-      {/* Accept / Reject cards */}
-      <div className="grid grid-cols-2 gap-2.5">
+      {/* Action buttons */}
+      <div className="grid grid-cols-2 gap-2">
+        {/* 수락 */}
         <button
           onClick={handleAcceptAll}
           disabled={isApplying}
-          className="flex flex-col items-center gap-2 rounded-xl border-2 border-emerald-200 bg-emerald-50 px-4 py-4 transition-all hover:border-emerald-300 hover:bg-emerald-100 active:scale-[0.98] disabled:opacity-50 dark:border-emerald-800 dark:bg-emerald-900/20 dark:hover:bg-emerald-900/30"
+          className="flex flex-col items-center gap-1.5 rounded-xl border-2 border-emerald-200 bg-emerald-50 px-3 py-3 transition-all hover:border-emerald-300 hover:bg-emerald-100 active:scale-[0.98] disabled:opacity-50 dark:border-emerald-800 dark:bg-emerald-900/20 dark:hover:bg-emerald-900/30"
         >
-          <svg
-            width="28"
-            height="28"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2.5"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            className="text-emerald-500"
-          >
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className="text-emerald-500">
             <polyline points="20 6 9 17 4 12" />
           </svg>
-          <span className="text-sm font-semibold text-emerald-700 dark:text-emerald-400">
-            {isApplying ? '적용 중...' : 'AI 제안 전체 수락'}
+          <span className="text-xs font-semibold text-emerald-700 dark:text-emerald-400">
+            {isApplying ? '적용 중...' : '수락'}
           </span>
         </button>
 
+        {/* 거절 */}
         <button
           onClick={handleRejectAll}
           disabled={isApplying}
-          className="flex flex-col items-center gap-2 rounded-xl border-2 border-gray-200 bg-gray-50 px-4 py-4 transition-all hover:border-gray-300 hover:bg-gray-100 active:scale-[0.98] disabled:opacity-50 dark:border-gray-700 dark:bg-gray-800/50 dark:hover:bg-gray-800"
+          className="flex flex-col items-center gap-1.5 rounded-xl border-2 border-gray-200 bg-gray-50 px-3 py-3 transition-all hover:border-gray-300 hover:bg-gray-100 active:scale-[0.98] disabled:opacity-50 dark:border-gray-700 dark:bg-gray-800/50 dark:hover:bg-gray-800"
         >
-          <svg
-            width="28"
-            height="28"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2.5"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            className="text-red-400"
-          >
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className="text-red-400">
             <line x1="18" y1="6" x2="6" y2="18" />
             <line x1="6" y1="6" x2="18" y2="18" />
           </svg>
-          <span className="text-sm font-semibold text-gray-600 dark:text-gray-300">
-            AI 제안 전체 거절
+          <span className="text-xs font-semibold text-gray-600 dark:text-gray-300">
+            거절
           </span>
         </button>
       </div>

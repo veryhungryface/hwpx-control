@@ -11,6 +11,7 @@ import os
 import time
 import traceback
 import zipfile
+import html
 import xml.etree.ElementTree as ET
 
 # stdout을 UTF-8로 강제
@@ -29,6 +30,7 @@ class HwpBridge:
         self._doc_path = None  # 현재 문서 경로
         self._undo_count = 0   # 인라인 편집 Undo 카운트
         self._edit_session_active = False  # 인라인 편집 세션 활성화 여부
+        self._pending_edits = []  # Track Changes 미리보기용 편집 목록
 
     def _log(self, msg):
         """디버그 로그 → stderr (Electron이 캡처)"""
@@ -44,7 +46,7 @@ class HwpBridge:
             self._log("COM initialized (STA)")
 
     def _ensure_hwp_com(self):
-        """HWP COM 객체 연결 — ROT 항목에 Open(doc_path) 호출"""
+        """HWP COM 객체 연결 — ROT에서 실제 문서 COM 객체 가져오기 (Open 불필요)"""
         if self.hwp:
             # 이미 연결됨 — 유효성 확인
             try:
@@ -58,13 +60,7 @@ class HwpBridge:
         import pythoncom
         import win32com.client
 
-        doc_path = self._doc_path
-        if not doc_path or not os.path.exists(doc_path):
-            self._log("COM: no doc_path available")
-            return False
-
-        # ROT에서 HWP 객체를 찾아 Open(doc_path)으로 활성화
-        # (원래 HWP 인스턴스에 연결하기 위해 Open 필수)
+        # ROT에서 HWP 객체를 직접 가져옴 (Open 없이 — 실제 문서 COM 객체)
         try:
             ctx = pythoncom.CreateBindCtx(0)
             rot = pythoncom.GetRunningObjectTable()
@@ -82,37 +78,40 @@ class HwpBridge:
                     except Exception:
                         pass
 
-                    # Open으로 문서 접근 활성화 (이미 열려 있어도 OK)
-                    hwp.Open(doc_path)
+                    # Open 없이 텍스트 확인 — 비어있지 않으면 실제 문서
                     text = hwp.GetTextFile("TEXT", "")
                     if text and len(text) > 50:
                         self.hwp = hwp
-                        self._log(f"COM: Connected via ROT+Open '{name}', {len(text)} chars")
+                        self._log(f"COM: Connected via ROT '{name}', {len(text)} chars")
                         return True
                 except Exception:
                     continue
         except Exception as e:
-            self._log(f"COM ROT+Open failed: {e}")
+            self._log(f"COM ROT failed: {e}")
 
-        # 폴백: Dispatch + Open
-        try:
-            hwp = win32com.client.Dispatch("HWPFrame.HwpObject")
+        # 폴백: doc_path가 있으면 Dispatch + Open
+        doc_path = self._doc_path
+        if doc_path and os.path.exists(doc_path):
             try:
-                hwp.RegisterModule("FilePathCheckDLL", "FilePathCheckerModuleExample")
-            except Exception:
-                pass
-            hwp.Open(doc_path)
-            text = hwp.GetTextFile("TEXT", "")
-            if text and len(text) > 50:
+                hwp = win32com.client.Dispatch("HWPFrame.HwpObject")
+                try:
+                    hwp.RegisterModule("FilePathCheckDLL", "FilePathCheckerModuleExample")
+                except Exception:
+                    pass
+                hwp.Open(doc_path)
+                text = hwp.GetTextFile("TEXT", "")
+                if text and len(text) > 50:
+                    self.hwp = hwp
+                    self._log(f"COM: Connected via Dispatch+Open, {len(text)} chars")
+                    return True
                 self.hwp = hwp
-                self._log(f"COM: Connected via Dispatch+Open, {len(text)} chars")
+                self._log("COM: Connected via Dispatch (no document text)")
                 return True
-            self.hwp = hwp
-            self._log("COM: Connected via Dispatch (no document text)")
-            return True
-        except Exception as e:
-            self._log(f"COM creation FAILED: {e}")
-            return False
+            except Exception as e:
+                self._log(f"COM creation FAILED: {e}")
+
+        self._log("COM: no connection available")
+        return False
 
     # ── 연결 ──────────────────────────────────────────
 
@@ -301,6 +300,7 @@ class HwpBridge:
             try:
                 text = self.hwp.GetTextFile("TEXT", "")
                 if text and text.strip():
+                    text = html.unescape(text)
                     self._log(f"get_full_text: COM TEXT, {len(text)} chars")
                     return {"text": text}
             except Exception:
@@ -311,11 +311,56 @@ class HwpBridge:
         if doc_path and doc_path.lower().endswith('.hwpx'):
             text = self._parse_hwpx_text(doc_path)
             if text and text.strip():
+                text = html.unescape(text)
                 self._log(f"get_full_text: hwpx direct parse, {len(text)} chars")
                 return {"text": text}
 
         self._log("get_full_text: all methods returned empty")
         return {"text": ""}
+
+    # bullet/특수 문단 마커 패턴 (AI 검색에서 제외)
+    _BULLET_RE = re.compile(r'^[•☞※◎◆▶▷►■□●○★☆→←↑↓\-]+\s*')
+
+    def _clean_para(self, text):
+        """AI 컨텍스트용 문단 텍스트 정리: bullet 접두사 제거"""
+        return self._BULLET_RE.sub('', text)
+
+    def get_numbered_text(self):
+        """문단 번호가 포함된 텍스트 반환 (AI 컨텍스트용)
+        빈 문단은 건너뛰고, 내용이 있는 문단만 번호 부여.
+        bullet(•, ☞ 등) 접두사는 제거하여 AI가 clean 텍스트로 검색하도록 함.
+        반환: {"numberedText": "P1: ...\nP2: ...", "paragraphMap": {1: "원본텍스트", ...}}
+        """
+        if not self.connected:
+            return {"error": "Not connected"}
+
+        text = self._get_all_text()
+        if not text:
+            return {"numberedText": "", "paragraphMap": {}}
+
+        paragraphs = text.split('\r\n')
+        numbered_lines = []
+        paragraph_map = {}  # {번호: 클린 텍스트}
+        num = 0
+
+        for para in paragraphs:
+            stripped = para.strip()
+            if not stripped:
+                continue  # 빈 줄 건너뛰기
+            clean = self._clean_para(stripped)
+            if not clean:
+                continue  # bullet만 있는 줄 건너뛰기
+            num += 1
+            numbered_lines.append(f"P{num}: {clean}")
+            paragraph_map[num] = clean
+
+        numbered_text = '\n'.join(numbered_lines)
+        self._log(f"get_numbered_text: {num} paragraphs numbered")
+        return {
+            "numberedText": numbered_text,
+            "paragraphMap": paragraph_map,
+            "totalParagraphs": num
+        }
 
     def get_cursor_pos(self):
         if not self.connected:
@@ -351,12 +396,14 @@ class HwpBridge:
         return {"pages": max(1, len(lines) // 30 + 1)}
 
     def _get_all_text(self):
-        """모든 텍스트 읽기 (COM → hwpx 폴백)"""
+        """모든 텍스트 읽기 (COM → hwpx 폴백)
+        GetTextFile("TEXT")는 HTML 엔티티(&#8226; 등)를 반환하므로 디코딩 필수.
+        """
         if self.hwp:
             try:
                 text = self.hwp.GetTextFile("TEXT", "")
                 if text and text.strip():
-                    return text
+                    return html.unescape(text)
             except Exception:
                 pass
         # hwpx 파일 직접 파싱 폴백
@@ -364,7 +411,7 @@ class HwpBridge:
         if doc_path and doc_path.lower().endswith('.hwpx'):
             text = self._parse_hwpx_text(doc_path)
             if text and text.strip():
-                return text
+                return html.unescape(text)
         return ""
 
     def get_text_range(self, start_page, end_page):
@@ -402,165 +449,119 @@ class HwpBridge:
         except Exception as e:
             return {"error": str(e)}
 
-    # ── SendKeys 헬퍼 ─────────────────────────────────
+    # ── COM 직접 편집 헬퍼 ──────────────────────────────
 
-    def _get_hwp_hwnd(self):
-        """보이는 HWP 창의 hwnd 반환"""
-        import ctypes
-        from ctypes import wintypes
+    def _com_all_replace(self, search_text, replace_text):
+        """COM AllReplace로 텍스트 교체 (내부 모델에 반영)"""
+        act = self.hwp.CreateAction("AllReplace")
+        pset = act.CreateSet()
+        act.GetDefault(pset)
+        pset.SetItem("FindString", search_text)
+        pset.SetItem("ReplaceString", replace_text)
+        pset.SetItem("IgnoreMessage", 1)
+        pset.SetItem("FindRegExp", 0)
+        pset.SetItem("ReplaceMode", 1)
+        result = act.Execute(pset)
+        self._log(f"AllReplace: '{search_text[:30]}' → '{replace_text[:30]}' = {result}")
+        return result
 
-        user32 = ctypes.windll.user32
-        hwp_hwnd = None
+    def _com_save_and_refresh(self):
+        """FileSave로 디스크 저장 + 화면 갱신"""
+        try:
+            result = self.hwp.HAction.Run("FileSave")
+            self._log(f"FileSave result: {result}")
+        except Exception as e:
+            self._log(f"FileSave failed: {e}, trying Save()...")
+            try:
+                self.hwp.Save()
+                self._log("Save() OK")
+            except Exception as e2:
+                self._log(f"Save() also failed: {e2}")
+        try:
+            self.hwp.HAction.Run("MoveDocBegin")
+        except Exception:
+            pass
 
-        def enum_cb(hwnd, _):
-            nonlocal hwp_hwnd
-            if not user32.IsWindowVisible(hwnd):
-                return True
-            length = user32.GetWindowTextLengthW(hwnd)
-            if length == 0:
-                return True
-            buf = ctypes.create_unicode_buffer(length + 1)
-            user32.GetWindowTextW(hwnd, buf, length + 1)
-            title = buf.value
-            if "한글" in title and ("[" in title or ".hwp" in title.lower()):
-                hwp_hwnd = hwnd
-            return True
+    # ── Track Changes 마커 ─────────────────────────────
+    # COM CharShape는 화면에 안 보이므로 텍스트 마커 방식 사용
+    DEL_OPEN = "【삭제:"
+    DEL_CLOSE = "】"
+    ADD_OPEN = "【추가:"
+    ADD_CLOSE = "】"
 
-        WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
-        user32.EnumWindows(WNDENUMPROC(enum_cb), 0)
-        return hwp_hwnd
-
-    def _set_clipboard(self, text):
-        """클립보드에 텍스트 설정"""
-        import win32clipboard
-        win32clipboard.OpenClipboard()
-        win32clipboard.EmptyClipboard()
-        win32clipboard.SetClipboardText(text, win32clipboard.CF_UNICODETEXT)
-        win32clipboard.CloseClipboard()
-
-    def _send_key(self, vk, shift=False, ctrl=False, alt=False):
-        """키 전송"""
-        import win32api
-        import win32con
-        if alt:
-            win32api.keybd_event(0x12, 0, 0, 0)
-        if ctrl:
-            win32api.keybd_event(0x11, 0, 0, 0)
-        if shift:
-            win32api.keybd_event(0x10, 0, 0, 0)
-        win32api.keybd_event(vk, 0, 0, 0)
-        time.sleep(0.02)
-        win32api.keybd_event(vk, 0, win32con.KEYEVENTF_KEYUP, 0)
-        if shift:
-            win32api.keybd_event(0x10, 0, win32con.KEYEVENTF_KEYUP, 0)
-        if ctrl:
-            win32api.keybd_event(0x11, 0, win32con.KEYEVENTF_KEYUP, 0)
-        if alt:
-            win32api.keybd_event(0x12, 0, win32con.KEYEVENTF_KEYUP, 0)
-        time.sleep(0.1)
-
-    def _find_and_replace_sendkeys(self, hwp_hwnd, search_text, replace_text):
-        """SendKeys로 HWP의 찾기/바꾸기(Ctrl+H) 실행 — 보이는 문서에서 직접 동작"""
-        import win32gui
-
-        # HWP 창 활성화
-        win32gui.SetForegroundWindow(hwp_hwnd)
-        time.sleep(0.5)
-
-        # Ctrl+H (찾아 바꾸기 대화상자)
-        self._send_key(0x48, ctrl=True)
-        time.sleep(1)
-
-        # 찾기 필드: Ctrl+A → 클립보드 붙여넣기
-        self._send_key(0x41, ctrl=True)
-        time.sleep(0.1)
-        self._set_clipboard(search_text)
-        self._send_key(0x56, ctrl=True)
-        time.sleep(0.2)
-
-        # Tab → 바꿀 텍스트 필드
-        self._send_key(0x09)
-        time.sleep(0.1)
-
-        # 바꿀 텍스트 필드: Ctrl+A → 입력
-        self._send_key(0x41, ctrl=True)
-        time.sleep(0.1)
-        if replace_text:
-            self._set_clipboard(replace_text)
-            self._send_key(0x56, ctrl=True)
-        else:
-            # 빈 문자열이면 필드 내용 삭제
-            self._send_key(0x2E)  # Delete key
-        time.sleep(0.2)
-
-        # Alt+A (모두 바꾸기)
-        self._send_key(0x41, alt=True)
-        time.sleep(0.5)
-
-        # Enter (결과 대화상자 닫기)
-        self._send_key(0x0D)
-        time.sleep(0.3)
-
-        # Escape (찾아 바꾸기 대화상자 닫기)
-        self._send_key(0x1B)
-        time.sleep(0.3)
-
-        self._log(f"  SendKeys replace: '{search_text[:30]}' → '{replace_text[:30]}'")
-
-    # ── 인라인 편집 (SendKeys 기반) ────────────────────
+    # ── 인라인 편집 (Track Changes 미리보기) ────────────
 
     def apply_inline_edits(self, edits):
-        """SendKeys로 HWP의 보이는 문서를 직접 편집 (찾기/바꾸기)
-        edits: [{"action": "replace"|"delete", "paragraph": N, "search": "...", "text": "..."}]
+        """Track Changes 스타일 미리보기 — 마커로 원본/수정 텍스트 표시
+        edits: [{"action": "replace"|"delete"|"insert", "paragraph": N, "search": "...", "text": "..."}]
+
+        replace: "old" → "【삭제:old】【추가:new】"
+        delete:  "old" → "【삭제:old】"
+        insert:  "anchor" → "anchor【추가:new】"
         """
-        hwp_hwnd = self._get_hwp_hwnd()
-        if not hwp_hwnd:
-            return {"error": "HWP window not found"}
+        if not self._ensure_hwp_com():
+            return {"error": "COM not available"}
 
         applied = 0
         failed = 0
         errors = []
+        self._pending_edits = []  # 수락/거절용 저장
         self._undo_count = 0
 
         for edit in edits:
             action = edit.get('action')
+            search_text = edit.get('search', '')
+            new_text = edit.get('text', '')
+
             try:
                 if action == 'replace':
-                    search_text = edit.get('search', '')
-                    new_text = edit.get('text', '')
                     if not search_text or not new_text:
                         failed += 1
                         errors.append("replace: search/text missing")
                         continue
-                    self._find_and_replace_sendkeys(hwp_hwnd, search_text, new_text)
+                    # "old" → "【삭제:old】【추가:new】"
+                    marker = (f"{self.DEL_OPEN}{search_text}{self.DEL_CLOSE}"
+                              f"{self.ADD_OPEN}{new_text}{self.ADD_CLOSE}")
+                    self._com_all_replace(search_text, marker)
+                    self._pending_edits.append({
+                        'action': 'replace',
+                        'search': search_text,
+                        'text': new_text,
+                    })
                     self._undo_count += 1
                     applied += 1
 
                 elif action == 'delete':
-                    search_text = edit.get('search', '')
                     if not search_text:
                         failed += 1
                         errors.append("delete: search text missing")
                         continue
-                    self._find_and_replace_sendkeys(hwp_hwnd, search_text, '')
+                    # "old" → "【삭제:old】"
+                    marker = f"{self.DEL_OPEN}{search_text}{self.DEL_CLOSE}"
+                    self._com_all_replace(search_text, marker)
+                    self._pending_edits.append({
+                        'action': 'delete',
+                        'search': search_text,
+                    })
                     self._undo_count += 1
                     applied += 1
 
                 elif action == 'insert':
-                    # insert는 SendKeys 찾기/바꾸기로 직접 지원 어려움
-                    # → 텍스트 앵커가 있으면 앵커 뒤에 추가
-                    search_text = edit.get('search', '')
-                    new_text = edit.get('text', '')
-                    if search_text and new_text:
-                        # 앵커 텍스트 뒤에 새 텍스트 추가
-                        self._find_and_replace_sendkeys(
-                            hwp_hwnd, search_text, search_text + '\r\n' + new_text
-                        )
-                        self._undo_count += 1
-                        applied += 1
-                    else:
+                    if not search_text or not new_text:
                         failed += 1
                         errors.append("insert: search (anchor) and text required")
+                        continue
+                    # "anchor" → "anchor【추가:new】"
+                    marker = f"{search_text}{self.ADD_OPEN}{new_text}{self.ADD_CLOSE}"
+                    self._com_all_replace(search_text, marker)
+                    self._pending_edits.append({
+                        'action': 'insert',
+                        'search': search_text,
+                        'text': new_text,
+                    })
+                    self._undo_count += 1
+                    applied += 1
+
                 else:
                     failed += 1
                     errors.append(f"unknown action: {action}")
@@ -568,38 +569,96 @@ class HwpBridge:
             except Exception as e:
                 failed += 1
                 errors.append(str(e))
-                self._log(f"  SendKeys edit error: {e}")
+                self._log(f"  COM edit error: {e}")
 
-        self._log(f"apply_inline_edits(SendKeys): applied={applied}, failed={failed}")
+        # 모든 편집 후 한번에 저장 → 화면 갱신
+        if applied > 0:
+            self._edit_session_active = True
+            self._com_save_and_refresh()
+
+        self._log(f"apply_inline_edits(TC): applied={applied}, failed={failed}")
         return {"applied": applied, "failed": failed, "errors": errors}
 
     def accept_inline_edits(self):
-        """편집 수락 — SendKeys 방식에서는 이미 문서에 반영됨 (no-op)"""
-        self._edit_session_active = False
-        self._undo_count = 0
-        self._log("accept_inline_edits: no-op (already applied via SendKeys)")
-        return {"success": True}
+        """편집 수락 — 마커를 수정 텍스트로 교체
+        replace: 【삭:old】【추:new】 → new
+        delete:  【삭:old】 → (삭제)
+        insert:  anchor【추:new】 → anchor + new
+        """
+        if not self._ensure_hwp_com():
+            return {"error": "COM not available"}
 
-    def reject_inline_edits(self):
-        """편집 거절 — SendKeys Ctrl+Z로 되돌리기"""
-        hwp_hwnd = self._get_hwp_hwnd()
-        if not hwp_hwnd:
-            return {"error": "HWP window not found"}
+        pending = getattr(self, '_pending_edits', [])
+        if not pending:
+            self._log("accept_inline_edits: no pending edits")
+            return {"success": True}
 
         try:
-            import win32gui
-            win32gui.SetForegroundWindow(hwp_hwnd)
-            time.sleep(0.3)
+            for edit in pending:
+                action = edit['action']
+                search = edit.get('search', '')
+                text = edit.get('text', '')
 
-            count = self._undo_count
-            for _ in range(count):
-                self._send_key(0x5A, ctrl=True)  # Ctrl+Z
-                time.sleep(0.2)
+                if action == 'replace':
+                    marker = (f"{self.DEL_OPEN}{search}{self.DEL_CLOSE}"
+                              f"{self.ADD_OPEN}{text}{self.ADD_CLOSE}")
+                    self._com_all_replace(marker, text)
+                elif action == 'delete':
+                    marker = f"{self.DEL_OPEN}{search}{self.DEL_CLOSE}"
+                    self._com_all_replace(marker, '')
+                elif action == 'insert':
+                    marker = f"{search}{self.ADD_OPEN}{text}{self.ADD_CLOSE}"
+                    self._com_all_replace(marker, search + text)
 
+            self._com_save_and_refresh()
             self._edit_session_active = False
+            self._pending_edits = []
             self._undo_count = 0
-            self._log(f"reject_inline_edits: Ctrl+Z × {count}")
-            return {"success": True, "undone": count}
+            self._log(f"accept_inline_edits: {len(pending)} edits accepted")
+            return {"success": True}
+
+        except Exception as e:
+            self._log(f"accept_inline_edits ERROR: {e}")
+            return {"error": str(e)}
+
+    def reject_inline_edits(self):
+        """편집 거절 — 마커를 원본 텍스트로 복원
+        replace: 【삭:old】【추:new】 → old
+        delete:  【삭:old】 → old
+        insert:  anchor【추:new】 → anchor
+        """
+        if not self._ensure_hwp_com():
+            return {"error": "COM not available"}
+
+        pending = getattr(self, '_pending_edits', [])
+        if not pending:
+            self._log("reject_inline_edits: no pending edits")
+            return {"success": True}
+
+        try:
+            for edit in pending:
+                action = edit['action']
+                search = edit.get('search', '')
+                text = edit.get('text', '')
+
+                if action == 'replace':
+                    marker = (f"{self.DEL_OPEN}{search}{self.DEL_CLOSE}"
+                              f"{self.ADD_OPEN}{text}{self.ADD_CLOSE}")
+                    self._com_all_replace(marker, search)
+                elif action == 'delete':
+                    marker = f"{self.DEL_OPEN}{search}{self.DEL_CLOSE}"
+                    self._com_all_replace(marker, search)
+                elif action == 'insert':
+                    marker = f"{search}{self.ADD_OPEN}{text}{self.ADD_CLOSE}"
+                    self._com_all_replace(marker, search)
+
+            self._com_save_and_refresh()
+            self._edit_session_active = False
+            self._pending_edits = []
+            self._undo_count = 0
+            self._log(f"reject_inline_edits: {len(pending)} edits rejected")
+            return {"success": True}
+
         except Exception as e:
             self._log(f"reject_inline_edits ERROR: {e}")
             return {"error": str(e)}
@@ -824,21 +883,12 @@ class HwpBridge:
             return {"error": str(e)}
 
     def find_and_replace(self, paragraph_index, search, replacement):
-        """특정 문단에서 문자열 교체"""
+        """문자열 교체 (COM AllReplace + FileSave — 화면에 반영됨)"""
         if not self._ensure_hwp_com():
             return {"error": "COM not available"}
         try:
-            # FindReplace 액션 사용
-            act = self.hwp.CreateAction("AllReplace")
-            pset = act.CreateSet()
-            act.GetDefault(pset)
-            pset.SetItem("FindString", search)
-            pset.SetItem("ReplaceString", replacement)
-            pset.SetItem("IgnoreMessage", 1)  # 대화상자 표시 안 함
-            pset.SetItem("FindRegExp", 0)
-            pset.SetItem("ReplaceMode", 1)  # 1 = 모두 바꾸기
-            act.Execute(pset)
-
+            self._com_all_replace(search, replacement)
+            self._com_save_and_refresh()
             return {"success": True}
         except Exception as e:
             return {"error": str(e)}
@@ -936,6 +986,7 @@ def main():
         "isConnected": lambda p: bridge.is_connected(),
         "findHwpWindow": lambda p: bridge.find_hwp_window(),
         "getFullText": lambda p: bridge.get_full_text(),
+        "getNumberedText": lambda p: bridge.get_numbered_text(),
         "getCursorPos": lambda p: bridge.get_cursor_pos(),
         "getTotalPages": lambda p: bridge.get_total_pages(),
         "getTextRange": lambda p: bridge.get_text_range(p.get("startPage", 1), p.get("endPage", 10)),

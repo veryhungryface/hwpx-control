@@ -65,14 +65,52 @@ def send_key(vk, shift=False, ctrl=False, alt=False):
         win32api.keybd_event(0x12, 0, win32con.KEYEVENTF_KEYUP, 0)
     time.sleep(0.1)
 
+def activate_window(hwnd):
+    """Windows 포그라운드 제한을 우회하여 창 활성화"""
+    try:
+        if win32gui.IsIconic(hwnd):
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            time.sleep(0.3)
+
+        # Alt 키 트릭: Alt를 누른 상태에서 SetForegroundWindow
+        win32api.keybd_event(0x12, 0, 0, 0)
+        time.sleep(0.02)
+        try:
+            win32gui.SetForegroundWindow(hwnd)
+        except Exception:
+            pass
+        win32api.keybd_event(0x12, 0, win32con.KEYEVENTF_KEYUP, 0)
+        time.sleep(0.3)
+
+        if win32gui.GetForegroundWindow() == hwnd:
+            return True
+
+        # 방법 2: AttachThreadInput
+        user32 = ctypes.windll.user32
+        current_thread = user32.GetCurrentThreadId()
+        target_thread = user32.GetWindowThreadProcessId(hwnd, None)
+        if current_thread != target_thread:
+            user32.AttachThreadInput(current_thread, target_thread, True)
+            try:
+                user32.SetForegroundWindow(hwnd)
+                user32.BringWindowToTop(hwnd)
+            finally:
+                user32.AttachThreadInput(current_thread, target_thread, False)
+            time.sleep(0.3)
+        return win32gui.GetForegroundWindow() == hwnd
+    except Exception as e:
+        log(f"activate_window error: {e}")
+        return False
+
 def find_and_replace_sendkeys(hwp_hwnd, search_text, replace_text):
     """
     HWP의 찾기/바꾸기 대화상자를 SendKeys로 조작
     Ctrl+H → 찾기 텍스트 입력 → 바꿀 텍스트 입력 → 모두 바꾸기 → 닫기
     """
-    # HWP 창 활성화
-    win32gui.SetForegroundWindow(hwp_hwnd)
-    time.sleep(0.5)
+    # HWP 창 활성화 (포그라운드 제한 우회)
+    ok = activate_window(hwp_hwnd)
+    log(f"  activate_window: {'OK' if ok else 'FAILED (proceeding anyway)'}")
+    time.sleep(0.3)
 
     # Ctrl+H (찾아 바꾸기 대화상자 열기)
     log("  Ctrl+H 전송...")

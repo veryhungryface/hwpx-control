@@ -27,7 +27,7 @@ export interface Message {
   createdAt: string
 }
 
-export type EditStatus = 'none' | 'pending' | 'accepted' | 'rejected' | 'partial'
+export type EditStatus = 'none' | 'pending' | 'previewing' | 'accepted' | 'rejected' | 'partial'
 
 // === 편집 명령 ===
 

@@ -71,6 +71,8 @@ export function registerIpcHandlers(params: {
   })
 
   ipcMain.handle(IPC.HWP_APPLY_EDITS, async (_event, edits: EditCommand[], messageId?: string) => {
+    console.log(`[IPC] HWP_APPLY_EDITS: ${edits.length} edits, messageId=${messageId}`)
+
     // Save snapshots to edit_history before applying
     const historyEntries = edits.map((edit, seq) => {
       const originalText = edit.action !== 'insert' ? edit.search ?? null : null
@@ -86,6 +88,7 @@ export function registerIpcHandlers(params: {
     })
 
     const result = await hwpService.applyEdits(edits)
+    console.log(`[IPC] HWP_APPLY_EDITS result: applied=${result.applied}, failed=${result.failed}, errors=${JSON.stringify(result.errors)}`)
 
     // Update edit_history statuses
     const now = new Date().toISOString()
@@ -138,11 +141,15 @@ export function registerIpcHandlers(params: {
   })
 
   ipcMain.handle(IPC.HWP_ACCEPT_INLINE, async () => {
+    console.log('[IPC] HWP_ACCEPT_INLINE called')
     await hwpService.acceptInlineEdits()
+    console.log('[IPC] HWP_ACCEPT_INLINE done')
   })
 
   ipcMain.handle(IPC.HWP_REJECT_INLINE, async () => {
+    console.log('[IPC] HWP_REJECT_INLINE called')
     await hwpService.rejectInlineEdits()
+    console.log('[IPC] HWP_REJECT_INLINE done')
   })
 
   ipcMain.handle(IPC.HWP_GET_SELECTION, () => {
@@ -172,10 +179,12 @@ export function registerIpcHandlers(params: {
         content: m.content
       }))
 
-      // 3. Read document context from HWP
+      // 3. Read document context from HWP (넘버링된 텍스트 포함)
       let documentContext = null
+      let numberedContext: { numberedText: string; paragraphMap: Record<number, string>; totalParagraphs: number } | null = null
       try {
         documentContext = await hwpService.readDocumentContext(pageRange)
+        numberedContext = await hwpService.readNumberedContext()
       } catch {
         // HWP may not be connected — proceed without context
       }
@@ -185,6 +194,7 @@ export function registerIpcHandlers(params: {
       const result = await aiService.chat({
         messages: history,
         documentContext,
+        numberedText: numberedContext?.numberedText ?? null,
         mode,
         onChunk: (chunk: string) => {
           mainWindow.webContents.send(IPC.AI_STREAM_CHUNK, chunk)

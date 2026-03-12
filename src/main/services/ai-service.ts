@@ -16,9 +16,10 @@ function formatParagraphs(context: DocumentContext): string {
     .join('\n')
 }
 
-function buildEditModePrompt(context: DocumentContext): string {
+function buildEditModePrompt(context: DocumentContext, numberedText?: string | null): string {
   const [startPage, endPage] = context.pageRange
-  const numberedParagraphs = formatParagraphs(context)
+  // 넘버링된 텍스트가 있으면 사용, 없으면 기존 방식
+  const paragraphsDisplay = numberedText || formatParagraphs(context)
 
   return `당신은 HWP 문서 편집 AI 비서입니다.
 
@@ -26,8 +27,9 @@ function buildEditModePrompt(context: DocumentContext): string {
 사용자가 제공하는 한글 문서 텍스트를 분석하고, 요청에 따라 정확한 편집 명령을 생성합니다.
 
 ## 문서 형식
-- 문서 텍스트는 [P1], [P2], [P3]... 형태의 문단 번호가 붙어 있습니다.
+- 문서 텍스트는 P1:, P2:, P3:... 형태의 문단 번호가 붙어 있습니다.
 - 각 번호는 해당 문단의 고유 식별자입니다.
+- 빈 줄은 번호가 없으며 건너뜁니다.
 
 ## 응답 규칙
 1. 먼저 자연어로 어떤 편집을 왜 하는지 간단히 설명합니다.
@@ -47,28 +49,31 @@ function buildEditModePrompt(context: DocumentContext): string {
   {
     "action": "insert",
     "paragraph": 10,
-    "text": "이 문단 뒤에 삽입될 새 문단 텍스트"
+    "search": "이 텍스트 뒤에 삽입할 앵커",
+    "text": "앵커 뒤에 삽입될 새 텍스트"
   },
   {
     "action": "delete",
-    "paragraph": 15
+    "paragraph": 15,
+    "search": "삭제할 텍스트"
   }
 ]
 </edit>
 
-## 주의사항
-- replace의 "search"는 해당 문단에서 **정확히 일치**하는 부분 문자열이어야 합니다.
-- 문단 전체를 교체하려면 search에 문단 전체 텍스트를 넣으세요.
-- 여러 곳을 동시에 편집할 때, 문단 번호가 큰 것부터 작은 것 순서로 나열하세요.
+## 중요 — search 필드 규칙
+- **replace**: "search"는 문서에서 **정확히 일치**하는 부분 문자열이어야 합니다. 문서 전체에서 고유한 텍스트를 사용하세요.
+- **insert**: "search"는 삽입 위치를 지정하는 앵커 텍스트입니다. 이 텍스트 뒤에 새 텍스트가 추가됩니다.
+- **delete**: "search"는 삭제할 정확한 텍스트입니다.
+- 여러 곳을 동시에 편집할 때, paragraph 번호 참조로 위치를 알려주세요.
 - 확실하지 않은 편집은 하지 마세요. 대신 사용자에게 확인을 요청하세요.
 
-## 현재 문서 (페이지 ${startPage}~${endPage}, 총 ${context.totalParagraphs}페이지)
-${numberedParagraphs}`
+## 현재 문서 (페이지 ${startPage}~${endPage})
+${paragraphsDisplay}`
 }
 
-function buildChatModePrompt(context: DocumentContext): string {
+function buildChatModePrompt(context: DocumentContext, numberedText?: string | null): string {
   const [startPage, endPage] = context.pageRange
-  const numberedParagraphs = formatParagraphs(context)
+  const paragraphsDisplay = numberedText || formatParagraphs(context)
 
   return `당신은 HWP 문서에 대해 대화하는 AI 비서입니다.
 
@@ -82,8 +87,8 @@ function buildChatModePrompt(context: DocumentContext): string {
 - 문서에 없는 내용은 추측하지 말고 모른다고 말하세요.
 - 마크다운 형식으로 깔끔하게 답변하세요.
 
-## 현재 문서 (페이지 ${startPage}~${endPage}, 총 ${context.totalParagraphs}페이지)
-${numberedParagraphs}`
+## 현재 문서 (페이지 ${startPage}~${endPage})
+${paragraphsDisplay}`
 }
 
 // ──────────────────────────────────────
@@ -101,6 +106,7 @@ function estimateTokens(text: string): number {
 interface ChatParams {
   messages: Array<{ role: string; content: string }>
   documentContext: DocumentContext | null
+  numberedText?: string | null
   mode: 'edit' | 'chat'
   onChunk: (chunk: string) => void
   signal?: AbortSignal
@@ -133,11 +139,15 @@ export class AiService {
   }
 
   // 시스템 프롬프트 구성
-  private buildSystemPrompt(documentContext: DocumentContext | null, mode: 'edit' | 'chat'): string {
+  private buildSystemPrompt(
+    documentContext: DocumentContext | null,
+    mode: 'edit' | 'chat',
+    numberedText?: string | null
+  ): string {
     if (documentContext) {
       return mode === 'edit'
-        ? buildEditModePrompt(documentContext)
-        : buildChatModePrompt(documentContext)
+        ? buildEditModePrompt(documentContext, numberedText)
+        : buildChatModePrompt(documentContext, numberedText)
     }
     return mode === 'edit'
       ? '당신은 HWP 문서 편집 AI 비서입니다. 현재 연결된 문서가 없습니다.'
@@ -166,9 +176,9 @@ export class AiService {
   // ── Claude 스트리밍 ────────────────────
 
   private async chatClaude(params: ChatParams, apiKey: string): Promise<ChatResult> {
-    const { messages, documentContext, mode, onChunk, signal } = params
+    const { messages, documentContext, numberedText, mode, onChunk, signal } = params
 
-    const systemPrompt = this.buildSystemPrompt(documentContext, mode)
+    const systemPrompt = this.buildSystemPrompt(documentContext, mode, numberedText)
     this.warnTokenBudget(systemPrompt, messages)
 
     const client = new Anthropic({ apiKey })
@@ -223,9 +233,9 @@ export class AiService {
   // ── OpenAI 스트리밍 ────────────────────
 
   private async chatOpenAI(params: ChatParams, apiKey: string): Promise<ChatResult> {
-    const { messages, documentContext, mode, onChunk, signal } = params
+    const { messages, documentContext, numberedText, mode, onChunk, signal } = params
 
-    const systemPrompt = this.buildSystemPrompt(documentContext, mode)
+    const systemPrompt = this.buildSystemPrompt(documentContext, mode, numberedText)
     this.warnTokenBudget(systemPrompt, messages)
 
     const client = new OpenAI({ apiKey })
